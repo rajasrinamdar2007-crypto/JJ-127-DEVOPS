@@ -23,8 +23,15 @@ jobs:
       # and bad interpolation. Note the frontend service's build context is ../anpr-frontend,
       # a separate repository that is NOT present here; `config` only resolves the value and
       # does not require it to exist, so this passes without the frontend sources.
+      #
+      # --env-file is required, not cosmetic. The real .env is gitignored, so on a fresh
+      # runner there is no .env at all, and docker-compose.yml marks variables like CAM2_ID
+      # as required (${CAM2_ID:?...}). Without this the job fails on missing variables and
+      # never actually checks the compose file. Validating against the committed
+      # .env.example additionally catches drift: a new required variable added to
+      # docker-compose.yml but forgotten in .env.example fails here rather than at deploy.
       - name: Validate docker-compose.yml
-        run: docker compose config --quiet
+        run: docker compose --env-file .env.example config --quiet
 
   python:
     name: Python compiles (${{ matrix.module }})
