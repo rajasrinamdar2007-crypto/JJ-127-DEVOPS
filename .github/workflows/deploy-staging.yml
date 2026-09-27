@@ -1,0 +1,175 @@
+name: Deploy staging
+
+# Env-only deploy. It pushes the new .env, restarts the stack, and does not rebuild images.
+# The single exception is the frontend's API base URL - see "Decide whether the dashboard
+# needs a rebuild" below.
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+    inputs:
+      force_frontend_rebuild:
+        description: Rebuild the frontend image even if the API base URL is unchanged
+        type: boolean
+        default: false
+
+concurrency:
+  group: deploy-staging
+  # Never cancel a deploy midway. Cancelling between "restart" and "verify" would leave the
+  # staging box in a state nobody asked for.
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to staging
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure SSH from secrets
+        run: |
+          install -m 700 -d ~/.ssh
+          # The key never appears in the repository, the workflow log, or the runner image.
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          # Pin the host key rather than disabling the check. StrictHostKeyChecking=no would
+          # make the deploy vulnerable to anything that can answer on that port.
+          printf '%s\n' "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      # Vite inlines VITE_API_URL into the bundle when it builds. The value in the running
+      # container is therefore frozen into the JavaScript that the browser already has, and
+      # restarting the container cannot change it. A restart is only correct while the
+      # configured base URL still matches what was baked in.
+      #
+      # Rather than trusting a flag, this reads the bundle the staging box is actually
+      # serving and looks for the expected base. If the string is absent, the deployed
+      # bundle was built against a different base and only a rebuild can fix it.
+      - name: Decide whether the dashboard needs a rebuild
+        id: frontend
+        env:
+          FORCE_REBUILD: ${{ inputs.force_frontend_rebuild }}
+          EXPECTED_API_BASE: ${{ vars.VITE_API_URL_STAGING }}
+          DEPLOY_HOST: ${{ secrets.SSH_HOST }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+        run: |
+          set -euo pipefail
+          if [ "${FORCE_REBUILD:-false}" = "true" ]; then
+            echo "rebuild=required" >> "$GITHUB_OUTPUT"
+            echo "forced via workflow_dispatch"
+            exit 0
+          fi
+          if [ -z "${EXPECTED_API_BASE:-}" ]; then
+            echo "::warning::VITE_API_URL_STAGING is not set, cannot verify the baked API base; skipping the rebuild check"
+            echo "rebuild=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          served=$(ssh -i ~/.ssh/id_deploy "deploy@${DEPLOY_HOST}" \
+            "curl -fsS http://localhost:\${FRONTEND_HOST_PORT:-8080}/" | grep -o '/assets/index-[A-Za-z0-9_-]*\.js' | head -1)
+          if [ -z "$served" ]; then
+            echo "::warning::could not determine the deployed bundle name; skipping the rebuild check"
+            echo "rebuild=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ssh -i ~/.ssh/id_deploy "deploy@${DEPLOY_HOST}" \
+               "curl -fsS 'http://localhost:\${FRONTEND_HOST_PORT:-8080}${served}'" | grep -qF "${EXPECTED_API_BASE}"; then
+            echo "deployed bundle already targets ${EXPECTED_API_BASE} - a restart is enough"
+            echo "rebuild=skipped" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::deployed bundle does not contain ${EXPECTED_API_BASE}."
+            echo "::notice::VITE_API_URL is baked in at build time, so this needs a REBUILD, not just a restart."
+            echo "rebuild=required" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push the environment file
+        env:
+          DEPLOY_HOST: ${{ secrets.SSH_HOST }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+        run: |
+          set -euo pipefail
+          # Only .env.example is in version control. The real .env is assembled on the
+          # server from the secrets below, so credentials never enter the repository or the
+          # build history.
+          scp -i ~/.ssh/id_deploy .env.example "deploy@${DEPLOY_HOST}:${DEPLOY_PATH}/.env.example"
+
+      - name: Apply the environment on the server
+        env:
+          DEPLOY_HOST: ${{ secrets.SSH_HOST }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_deploy "deploy@${DEPLOY_HOST}" bash -s <<'REMOTE'
+          set -euo pipefail
+          cd "${DEPLOY_PATH}"
+
+          # Passwords and other per-environment values are written from the Actions secret
+          # store, never committed. Each is only appended when the server does not already
+          # have it, so a rerun cannot blank out a working value.
+          write_secret() {
+            local key="$1" value="$2"
+            if [ -z "$value" ]; then
+              echo "::warning::$key not provided; leaving any existing value untouched"
+              return
+            fi
+            if grep -q "^${key}=" .env 2>/dev/null; then
+              sed -i "s|^${key}=.*|${key}=${value}|" .env
+            else
+              printf '%s=%s\n' "$key" "$value" >> .env
+            fi
+          }
+
+          write_secret POSTGRES_PASSWORD "$PG_PASSWORD"
+          write_secret MQTT_SERVER_PASSWORD "$MQTT_PASSWORD"
+
+          # Vite reads this at BUILD time. Changing it here only takes effect on the next
+          # frontend rebuild - that is what the step above decides about.
+          write_secret VITE_API_URL "$VITE_API_URL"
+
+          # --no-build: an env-only change does not alter any image.
+          make deploy
+          REMOTE
+        env:
+          PG_PASSWORD: ${{ secrets.STAGING_POSTGRES_PASSWORD }}
+          MQTT_PASSWORD: ${{ secrets.STAGING_MQTT_PASSWORD }}
+          VITE_API_URL: ${{ vars.VITE_API_URL_STAGING }}
+
+      # Only reached when the base URL check said the baked value is stale. This is the one
+      # case where a restart cannot do the job.
+      - name: Rebuild the dashboard
+        if: steps.frontend.outputs.rebuild == 'required'
+        env:
+          DEPLOY_HOST: ${{ secrets.SSH_HOST }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_deploy "deploy@${DEPLOY_HOST}" \
+            "cd '${DEPLOY_PATH}' && make deploy-frontend"
+          echo "::notice::dashboard rebuilt - the new API base is now baked into the bundle"
+
+      - name: Verify the stack is serving
+        env:
+          DEPLOY_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_deploy "deploy@${DEPLOY_HOST}" bash -s <<'REMOTE'
+          set -euo pipefail
+          cd "${DEPLOY_PATH}"
+          docker compose ps
+          # Fail the deploy if the dashboard is not actually answering, rather than
+          # reporting success and leaving a blank page for the next person to find.
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null "http://localhost:${FRONTEND_HOST_PORT:-8080}/"; then
+              echo "frontend is serving"
+              break
+            fi
+            [ "$i" -eq 30 ] && { echo "::error::frontend did not come up"; exit 1; }
+            sleep 2
+          done
+          curl -fsS "http://localhost:${FRONTEND_HOST_PORT:-8080}/api/plate-status-types" > /dev/null
+          echo "API proxy is answering through the dashboard"
+          REMOTE

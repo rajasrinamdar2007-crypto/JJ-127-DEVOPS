@@ -1,0 +1,153 @@
+name: Deploy production
+
+# Env-only deploy, same shape as deploy-staging.yml. Differences are deliberate:
+#   - runs from main, not dev
+#   - uses the `production` environment, so it can require a manual approval
+#   - no workflow_dispatch force-rebuild escape hatch; a rebuild in production has to be a
+#     conscious, reviewed change to this file or to the API base variable
+#   - verifies more before declaring success
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to production
+    runs-on: ubuntu-latest
+    # Set required reviewers on this environment to gate production deploys behind a human.
+    environment: production
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure SSH from secrets
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          printf '%s\n' "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      # Same reasoning as staging. The dashboard's VITE_API_URL is compiled into the bundle,
+      # so a restart can never update it; this checks what is actually being served and
+      # rebuilds only on a genuine mismatch. In production that mismatch is an error to
+      # investigate, not something to paper over automatically.
+      - name: Decide whether the dashboard needs a rebuild
+        id: frontend
+        env:
+          EXPECTED_API_BASE: ${{ vars.VITE_API_URL_PROD }}
+          DEPLOY_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          set -euo pipefail
+          if [ -z "${EXPECTED_API_BASE:-}" ]; then
+            echo "::warning::VITE_API_URL_PROD is not set; skipping the baked-base check"
+            echo "rebuild=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          served=$(ssh -i ~/.ssh/id_deploy "deploy@${DEPLOY_HOST}" \
+            "curl -fsS http://localhost:\${FRONTEND_HOST_PORT:-8080}/" | grep -o '/assets/index-[A-Za-z0-9_-]*\.js' | head -1)
+          if [ -z "$served" ]; then
+            echo "::warning::could not determine the deployed bundle name; skipping"
+            echo "rebuild=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ssh -i ~/.ssh/id_deploy "deploy@${DEPLOY_HOST}" \
+               "curl -fsS 'http://localhost:\${FRONTEND_HOST_PORT:-8080}${served}'" | grep -qF "${EXPECTED_API_BASE}"; then
+            echo "deployed bundle already targets ${EXPECTED_API_BASE} - a restart is enough"
+            echo "rebuild=skipped" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::deployed bundle does not contain ${EXPECTED_API_BASE}."
+            echo "::error::VITE_API_URL is baked in at build time: this needs 'make deploy-frontend', not just a restart."
+            echo "rebuild=required" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push the environment file
+        env:
+          DEPLOY_HOST: ${{ secrets.SSH_HOST }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+        run: |
+          set -euo pipefail
+          scp -i ~/.ssh/id_deploy .env.example "deploy@${DEPLOY_HOST}:${DEPLOY_PATH}/.env.example"
+
+      - name: Apply the environment on the server
+        env:
+          DEPLOY_HOST: ${{ secrets.SSH_HOST }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_deploy "deploy@${DEPLOY_HOST}" bash -s <<'REMOTE'
+          set -euo pipefail
+          cd "${DEPLOY_PATH}"
+
+          write_secret() {
+            local key="$1" value="$2"
+            if [ -z "$value" ]; then
+              echo "::warning::$key not provided; leaving any existing value untouched"
+              return
+            fi
+            if grep -q "^${key}=" .env 2>/dev/null; then
+              sed -i "s|^${key}=.*|${key}=${value}|" .env
+            else
+              printf '%s=%s\n' "$key" "$value" >> .env
+            fi
+          }
+
+          write_secret POSTGRES_PASSWORD "$PG_PASSWORD"
+          write_secret MQTT_SERVER_PASSWORD "$MQTT_PASSWORD"
+          write_secret VITE_API_URL "$VITE_API_URL"
+
+          make deploy
+          REMOTE
+        env:
+          PG_PASSWORD: ${{ secrets.PROD_POSTGRES_PASSWORD }}
+          MQTT_PASSWORD: ${{ secrets.PROD_MQTT_PASSWORD }}
+          VITE_API_URL: ${{ vars.VITE_API_URL_PROD }}
+
+      - name: Rebuild the dashboard
+        if: steps.frontend.outputs.rebuild == 'required'
+        env:
+          DEPLOY_HOST: ${{ secrets.SSH_HOST }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_deploy "deploy@${DEPLOY_HOST}" \
+            "cd '${DEPLOY_PATH}' && make deploy-frontend"
+
+      - name: Verify the stack is serving
+        env:
+          DEPLOY_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_deploy "deploy@${DEPLOY_HOST}" bash -s <<'REMOTE'
+          set -euo pipefail
+          cd "${DEPLOY_PATH}"
+          docker compose ps
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null "http://localhost:${FRONTEND_HOST_PORT:-8080}/"; then
+              break
+            fi
+            [ "$i" -eq 30 ] && { echo "::error::frontend did not come up"; exit 1; }
+            sleep 2
+          done
+          curl -fsS "http://localhost:${FRONTEND_HOST_PORT:-8080}/api/plate-status-types" > /dev/null
+          echo "dashboard and API proxy are answering"
+
+          # A restart that leaves a service down should fail the deploy, not be reported as
+          # a success with a note.
+          unhealthy=$(docker compose ps --format '{{.Service}} {{.Status}}' \
+            | grep -vE '\(healthy\)|running' || true)
+          if [ -n "$unhealthy" ]; then
+            echo "::error::these services are not healthy:"
+            echo "$unhealthy"
+            exit 1
+          fi
+          echo "all services healthy"
+          REMOTE

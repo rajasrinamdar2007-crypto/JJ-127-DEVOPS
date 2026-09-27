@@ -1,0 +1,176 @@
+name: CI
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+    branches: [dev]
+
+# A failing job cancels nothing else - every job is meant to report independently, so one
+# broken component never hides the state of the others.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compose:
+    name: Compose file is valid
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Catches indentation mistakes, a service referencing a file that no longer exists,
+      # and bad interpolation. Note the frontend service's build context is ../anpr-frontend,
+      # a separate repository that is NOT present here; `config` only resolves the value and
+      # does not require it to exist, so this passes without the frontend sources.
+      - name: Validate docker-compose.yml
+        run: docker compose config --quiet
+
+  python:
+    name: Python compiles (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    strategy:
+      # Each module is its own job, so a syntax error in one cannot mask the others and you
+      # get one red check per broken component instead of a single opaque failure.
+      fail-fast: false
+      matrix:
+        module:
+          - ingest
+          - edge-agent
+          - gis
+          - sim
+          - server
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # py_compile only parses, it never imports, so this needs no pip install and no
+      # database, broker or third-party package. It catches the class of error that
+      # otherwise only appears when a container starts: a typo, a bad indent, a missing
+      # colon, syntax that differs from the local interpreter.
+      - name: Byte-compile ${{ matrix.module }}
+        run: |
+          set -euo pipefail
+          files=$(find "${{ matrix.module }}" -name '*.py' -type f | sort)
+          if [ -z "$files" ]; then
+            echo "::error::no .py files found under ${{ matrix.module }}/"
+            exit 1
+          fi
+          echo "compiling $(echo "$files" | wc -l) file(s):"
+          echo "$files" | sed 's/^/  /'
+          # py_compile writes a __pycache__ next to every source file by default. Redirect
+          # it out of the checkout: it keeps the working tree clean so a stray .pyc can never
+          # be picked up by a later `git add -A`, and it lets this same command run against
+          # a read-only mount.
+          export PYTHONPYCACHEPREFIX="$RUNNER_TEMP/pycache/${{ matrix.module }}"
+          # shellcheck disable=SC2086
+          python -m py_compile $files
+          echo "OK: ${{ matrix.module }} compiles"
+
+  frontend:
+    name: Frontend builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The dashboard is a separate repository (docker-compose.yml refers to it as the
+      # sibling directory ../anpr-frontend), so it cannot come from this checkout. Point
+      # FRONTEND_REPO/FRONTEND_REF at a fork or a different branch by setting repository
+      # variables on the repository, without editing this file.
+      - name: Check out the frontend repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.FRONTEND_REPO || 'miloslava92/anpr-frontend' }}
+          ref: ${{ vars.FRONTEND_REF || 'main' }}
+          path: anpr-frontend
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: anpr-frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: anpr-frontend
+        run: npm ci
+
+      # This step is a hard gate on purpose. It has no `continue-on-error`, no `|| true`
+      # and is not in a matrix with allow-failure, so a broken build fails the workflow and
+      # blocks the branch. It type-checks as well as bundles, because `build` is
+      # `tsc -b && vite build` - a type error fails the build just as a bundler error does.
+      - name: Build (type check + bundle)
+        working-directory: anpr-frontend
+        run: npm run build
+
+      # Only run a linter if the project actually defines one. `npm run lint` on a project
+      # with no lint script exits non-zero with "Missing script", which would fail every
+      # build for a reason that has nothing to do with the code.
+      - name: Lint, if the project defines a lint script
+        working-directory: anpr-frontend
+        run: |
+          if node -e "process.exit(require('./package.json').scripts?.lint ? 0 : 1)"; then
+            echo "lint script found - running"
+            npm run lint
+          else
+            echo "no lint script in package.json - skipping"
+          fi
+
+      # Records what the build gate is currently NOT catching, so the exclusion cannot rot
+      # into invisibility. This step is informational: the excluded file is a known,
+      # accepted gap, not a build failure, so failing here would block every unrelated
+      # change. See the note below.
+      - name: Report outstanding type-check exclusions
+        working-directory: anpr-frontend
+        run: |
+          set -euo pipefail
+          # Read the exclusion list through TypeScript's own parser rather than
+          # `require('./tsconfig.json')`. tsconfig.json is JSONC and carries comments, so
+          # node's strict JSON parser rejects it. `tsc --showConfig` also resolves defaults
+          # and any `extends` chain, so this reports the effective list, not just the
+          # literal text. --no-install keeps npx from reaching the network; tsc is already
+          # a local dependency from the build step above.
+          npx --no-install tsc --showConfig > "$RUNNER_TEMP/tsconfig.resolved.json"
+
+          excluded=$(node -e "
+            const t = require(process.env.RUNNER_TEMP + '/tsconfig.resolved.json');
+            process.stdout.write(JSON.stringify(t.exclude || []));
+          ")
+          echo "files excluded from the type check: $excluded"
+          if [ "$excluded" != "[]" ]; then
+            while IFS= read -r path; do
+              [ -z "$path" ] && continue
+              if [ -f "$path" ]; then
+                echo "::warning file=$path::excluded from the type check - unresolved imports here will NOT fail CI. Outstanding debt."
+              else
+                echo "::warning::exclude entry '$path' does not match any file - it can be removed"
+              fi
+            done <<< "$(node -e "
+              const t = require(process.env.RUNNER_TEMP + '/tsconfig.resolved.json');
+              for (const p of (t.exclude || [])) console.log(p);
+            ")"
+          else
+            echo "no type-check exclusions - the build covers every source file"
+          fi
+
+# ---------------------------------------------------------------------------
+# Known gap, tracked on purpose:
+#
+# src/Login.tsx is excluded in the frontend tsconfig.json. It imports
+# ./components/LoginForm and ./components/ForgotPasswordModal, and that directory has
+# never existed in the frontend repository - the import was broken in its first and only
+# commit and no file was ever deleted, so this is an unfinished page rather than a
+# regression. The page is also unreachable: App.tsx routes only "/" to the dashboard.
+#
+# The consequence is that the "Frontend builds" check above is GREEN while those two
+# modules are still missing, because the file is not type-checked. The exclude is the
+# accepted trade-off: without it `npm run build` and the frontend Docker image both fail,
+# which blocks every unrelated change. The "Report outstanding type-check exclusions" step
+# surfaces it as a warning annotation on every run, and the annotation disappears when the
+# exclusion is removed.
+#
+# To close the gap for real: implement the two components, delete the exclude, and this
+# check will start covering the login page with no change to this file.
+# ---------------------------------------------------------------------------
