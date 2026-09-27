@@ -20,7 +20,7 @@ services:
     environment:
       # Only the healthcheck reads these; mosquitto.conf reads the password file.
       MQTT_SERVER_USER: ${MQTT_SERVER_USER:-server}
-      MQTT_SERVER_PASSWORD: ${MQTT_SERVER_PASSWORD:-REDACTED}
+      MQTT_SERVER_PASSWORD: ${MQTT_SERVER_PASSWORD:?set MQTT_SERVER_PASSWORD in .env}
     ports:
       - "${MQTT_HOST_PORT:-1883}:1883"
     volumes:
@@ -42,7 +42,7 @@ services:
     image: postgis/postgis:16-3.4
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-anpruser}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-REDACTED}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ${POSTGRES_DB:-anpr}
       # Read only by db/zz-cameras.sh, to seed the cameras table on first boot. The
       # same CAM* vars go to the edge agents, so the registry and the agents cannot
@@ -79,11 +79,11 @@ services:
       MQTT_HOST: mosquitto
       MQTT_PORT: "1883"
       MQTT_USERNAME: ${MQTT_INGEST_USER:-ingest}
-      MQTT_PASSWORD: ${MQTT_INGEST_PASSWORD:-REDACTED}
+      MQTT_PASSWORD: ${MQTT_INGEST_PASSWORD:?set MQTT_INGEST_PASSWORD in .env}
       POSTGRES_HOST: db
       POSTGRES_PORT: "5432"
       POSTGRES_USER: ${POSTGRES_USER:-anpruser}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-REDACTED}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ${POSTGRES_DB:-anpr}
     ports:
       - "${INGEST_HOST_PORT:-8000}:8000"
@@ -109,7 +109,7 @@ services:
       POSTGRES_HOST: db
       POSTGRES_PORT: "5432"
       POSTGRES_USER: ${POSTGRES_USER:-anpruser}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-REDACTED}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ${POSTGRES_DB:-anpr}
     ports:
       - "${GIS_HOST_PORT:-8001}:8000"
@@ -164,7 +164,7 @@ services:
       POSTGRES_HOST: db
       POSTGRES_PORT: "5432"
       POSTGRES_USER: ${POSTGRES_USER:-anpruser}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-REDACTED}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ${POSTGRES_DB:-anpr}
       # Where ./edge-agent/data is mounted in this container. The script's own default
       # is the repo-relative host path, which does not exist inside the image.
@@ -194,7 +194,7 @@ services:
       MQTT_HOST: mosquitto
       MQTT_PORT: "1883"
       MQTT_USERNAME: ${MQTT_DEBUG_USER:-debug}
-      MQTT_PASSWORD: ${MQTT_DEBUG_PASSWORD:-REDACTED}
+      MQTT_PASSWORD: ${MQTT_DEBUG_PASSWORD:?set MQTT_DEBUG_PASSWORD in .env}
     volumes:
       - ./server:/app
     depends_on:

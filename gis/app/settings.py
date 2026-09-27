@@ -18,7 +18,11 @@ CORS_ORIGINS = os.getenv(
 POSTGRES_HOST = os.getenv("POSTGRES_HOST", "db")
 POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
 POSTGRES_USER = os.getenv("POSTGRES_USER", "anpruser")
-POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "REDACTED")
+# No default on purpose. A baked-in fallback would let the service silently authenticate
+# with a password that is published in this repository, and would keep a credential
+# literal in version control. docker-compose.yml marks the variable required too, so a
+# missing value fails at startup with the variable's name rather than at query time.
+POSTGRES_PASSWORD = os.environ["POSTGRES_PASSWORD"]
 POSTGRES_DB = os.getenv("POSTGRES_DB", "anpr")
 
 # Tables the read-only database viewer may expose. Whitelist only, so the generic

@@ -1,0 +1,18 @@
+version: 1
+
+# The scanner flagged .env.example because it carried working passwords (REDACTED,
+# REDACTED, REDACTED-03) in a public repository. Those are now CHANGEME-* placeholders
+# that cannot authenticate against anything, and the rules below stop the placeholders from
+# re-alerting on every push. Removing this file without first emptying .env.example of real
+# credentials would only silence a true positive.
+allow:
+  - path: .env.example
+    reason: >-
+      Credential template. Every value is a CHANGEME-* placeholder, present only so a fresh
+      clone starts. The real .env is gitignored and never committed.
+
+# Anything that looks like a credential outside the template is treated as a real finding.
+# This is the default; it is listed so the intent is explicit and so widening the allow list
+# later is a deliberate act.
+notify:
+  - git: pre-commit

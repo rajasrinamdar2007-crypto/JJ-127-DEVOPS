@@ -390,7 +390,7 @@ Verified by stopping the database under the running service: `/health` returned
 
 | Env var | Default | Purpose |
 | --- | --- | --- |
-| `POSTGRES_HOST` / `_PORT` / `_USER` / `_PASSWORD` / `_DB` | `db` / `5432` / `anpruser` / `REDACTED` / `anpr` | database connection |
+| `POSTGRES_HOST` / `_PORT` / `_USER` / `_PASSWORD` / `_DB` | `db` / `5432` / `anpruser` / **required** / `anpr` | database connection |
 | `ALLOWED_TABLES` | `sightings,alerts,blacklist,cameras` | tables `/table/{name}` may expose |
 | `DEFAULT_SIGHTING_LIMIT` | `500` | default `?limit=` on `/sightings/geojson` |
 | `MAX_SIGHTING_LIMIT` | `5000` | hard ceiling on the same |

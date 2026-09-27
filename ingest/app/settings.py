@@ -20,5 +20,7 @@ MQTT_PASSWORD = os.getenv("MQTT_PASSWORD")
 POSTGRES_HOST = os.getenv("POSTGRES_HOST", "db")
 POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
 POSTGRES_USER = os.getenv("POSTGRES_USER", "anpruser")
-POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "REDACTED")
+# No default on purpose, for the same reason as gis/app/settings.py: a fallback would be a
+# published credential that also lets the service authenticate when it should not.
+POSTGRES_PASSWORD = os.environ["POSTGRES_PASSWORD"]
 POSTGRES_DB = os.getenv("POSTGRES_DB", "anpr")

@@ -40,11 +40,23 @@ from plates import TEST_BLACKLIST  # noqa: E402  (path shim above must run first
 log = logging.getLogger("sim.seed_blacklist")
 
 # Same DSN variables the rest of the stack uses, so there is one set of names to learn.
+# POSTGRES_PASSWORD deliberately has no fallback. A baked-in default would make this script
+# succeed against a database whose real password is something else, and it would put a
+# password literal in version control - which is how a credential ends up published in a
+# public repository. Fail here instead, with a message that says what to do.
+_db_password = os.getenv("POSTGRES_PASSWORD")
+if not _db_password:
+    sys.exit(
+        "POSTGRES_PASSWORD is not set. Copy .env.example to .env, replace the "
+        "CHANGEME-postgres placeholder with a password of your own, and source it "
+        "(or run this through `make seed-blacklist`, which loads .env for you)."
+    )
+
 DSN = (
     f"host={os.getenv('POSTGRES_HOST', 'db')} "
     f"port={os.getenv('POSTGRES_PORT', '5432')} "
     f"user={os.getenv('POSTGRES_USER', 'anpruser')} "
-    f"password={os.getenv('POSTGRES_PASSWORD', 'REDACTED')} "
+    f"password={_db_password} "
     f"dbname={os.getenv('POSTGRES_DB', 'anpr')}"
 )
 
