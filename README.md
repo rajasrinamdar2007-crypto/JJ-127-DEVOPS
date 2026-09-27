@@ -293,6 +293,90 @@ removed — it no longer generates fake sightings when the API is unreachable, a
 screen instead. Its nginx proxy config, Dockerfile and Compose service are in place, and the
 `frontend` image builds and serves the app.
 
+## Continuous integration and deployment
+
+Three workflows live in `.github/workflows/`, all triggered against `dev` (production
+deploys against `main`).
+
+| workflow | trigger | what it does |
+| --- | --- | --- |
+| `ci.yml` | push/PR to `dev` | compose validation, Python byte-compile, dashboard build |
+| `deploy-staging.yml` | push to `dev` | env-only deploy to the staging host |
+| `deploy-prod.yml` | push to `main` | env-only deploy to the production host |
+
+`ci.yml` runs three job groups. The five Python modules get **one job each**, with
+`fail-fast` off, so a syntax error in one module cannot mask the other four and a reviewer
+sees one red check per broken component. The check is `py_compile`, which only parses — no
+pip install, no database, no broker — with the bytecode cache redirected to `$RUNNER_TEMP`
+so the job cannot leave `.pyc` files in the checkout. The dashboard job is a hard gate: no
+`continue-on-error`, no `|| true`. Since its build script is `tsc -b && vite build`, a type
+error fails the job as surely as a bundler error. Lint runs only when `package.json`
+defines a `lint` script, because `npm run lint` on a project without one exits non-zero
+with `Missing script`.
+
+The compose job validates with `--env-file .env.example`. The real `.env` is gitignored, so
+a fresh runner has none, and `docker-compose.yml` marks variables like `${CAM2_ID:?...}` as
+required — without the flag the job fails on missing variables and never checks the compose
+file at all. Validating against the committed template also catches drift: a required
+variable added to `docker-compose.yml` but forgotten in `.env.example` fails in CI rather
+than at deploy time.
+
+### The dashboard is a separate repository
+
+`docker-compose.yml` refers to the dashboard as the sibling directory `../anpr-frontend`,
+and it lives in its own GitHub repository. The CI job therefore checks it out explicitly
+rather than expecting it in this checkout. Two repository **variables** on this repo control
+it, both optional:
+
+| variable | default | purpose |
+| --- | --- | --- |
+| `FRONTEND_REPO` | `miloslava92/anpr-frontend` | which repository holds the dashboard |
+| `FRONTEND_REF` | `main` | which branch to build |
+
+`FRONTEND_REF` is the one to watch. The dashboard's API integration (`src/api.ts`, the
+nginx proxy, the `tsconfig` exclude) has to exist on the branch being built — against a
+revision without it, `npm run build` fails on `Login.tsx` and `MapDashboard.tsx`. Point it
+at whatever branch actually carries the work rather than editing the workflow.
+
+### Deploys are env-only, and mostly do not rebuild
+
+Both deploy workflows push `.env.example`, write the per-environment secrets on the server,
+and restart with `make deploy` — which is `docker compose up -d --no-build`. Nothing about
+an environment change alters the images, so rebuilding on every deploy is pure cost.
+`make up` still rebuilds, which is the right default for local work.
+
+Two Makefile targets exist for this:
+
+```
+make deploy           docker compose up -d --no-build
+make deploy-frontend  docker compose up -d --build frontend
+```
+
+**The dashboard is the exception, and this is not a detail.** Vite inlines `VITE_API_URL`
+into the bundle at *build* time, so a container restart keeps serving the old base URL. No
+amount of restarting updates it. Rather than trust a flag, each workflow reads the bundle
+the target is actually serving, looks for the expected base URL, and rebuilds only on a
+genuine mismatch. Staging exposes a `force_frontend_rebuild` input on manual dispatch;
+production deliberately does not, so a production rebuild has to be a conscious change.
+
+Configure the `staging` and `production` GitHub **environments** with:
+
+| secret | purpose |
+| --- | --- |
+| `SSH_HOST` | deploy target |
+| `SSH_PRIVATE_KEY` | deploy key, written to `~/.ssh` at run time |
+| `SSH_KNOWN_HOSTS` | pinned host key — never `StrictHostKeyChecking=no` |
+| `STAGING_POSTGRES_PASSWORD` / `PROD_POSTGRES_PASSWORD` | written to `POSTGRES_PASSWORD` |
+| `STAGING_MQTT_PASSWORD` / `PROD_MQTT_PASSWORD` | written to `MQTT_SERVER_PASSWORD` |
+
+plus repository **variables** `DEPLOY_PATH`, `VITE_API_URL_STAGING` and
+`VITE_API_URL_PROD`. Nothing is hardcoded, and the real `.env` never enters version
+control — it is assembled on the server from these secrets. Set required reviewers on the
+`production` environment to gate production behind a human. Both workflows use
+`cancel-in-progress: false`; cancelling a deploy midway would leave the target in a state
+nobody asked for, and each one fails if the dashboard or the API proxy is not actually
+answering.
+
 ## Known limits
 
 - `src/Login.tsx` in the front-end repo imports `./components/LoginForm` and
