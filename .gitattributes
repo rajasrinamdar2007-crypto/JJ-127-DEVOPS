@@ -1,0 +1,12 @@
+# GitHub Actions lifts the `run:` blocks straight out of these YAML files and pipes them to
+# bash. A CRLF committed into a workflow arrives as a literal \r inside the script, and bash
+# fails with `$'\r': command not found` - a red job that has nothing to do with the code.
+# Checking these out as LF makes that failure impossible whatever core.autocrlf a
+# contributor happens to have set, on Windows or otherwise.
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.sh   text eol=lf
+
+# Same reasoning for the Python sources: LF everywhere keeps diffs and container COPY steps
+# predictable, and avoids a "\r" turning up in a shebang line.
+*.py   text eol=lf

@@ -1,0 +1,6 @@
+fastapi==0.115.8
+uvicorn==0.34.0
+paho-mqtt==2.1.0
+psycopg[binary]==3.2.3
+python-dotenv==1.0.1
+jsonschema==4.23.0

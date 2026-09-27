@@ -1,0 +1,268 @@
+# Anchor: everything an edge-agent instance shares. Each camera below merges this and
+# overrides only what is camera-specific. YAML merge keys are shallow, so the shared
+# environment is its own anchor - otherwise a child's `environment` block would
+# replace the shared one outright and silently drop MQTT_HOST.
+x-edge-agent-env: &edge-agent-env
+  MQTT_HOST: mosquitto
+  MQTT_PORT: "1883"
+  MQTT_KEEPALIVE: "60"
+
+x-edge-agent: &edge-agent
+  build: ./edge-agent
+  depends_on:
+    mosquitto:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    environment:
+      # Only the healthcheck reads these; mosquitto.conf reads the password file.
+      MQTT_SERVER_USER: ${MQTT_SERVER_USER:-server}
+      MQTT_SERVER_PASSWORD: ${MQTT_SERVER_PASSWORD:-REDACTED}
+    ports:
+      - "${MQTT_HOST_PORT:-1883}:1883"
+    volumes:
+      - ./mosquitto/config:/mosquitto/config
+      - ./mosquitto/data:/mosquitto/data
+      - ./mosquitto/log:/mosquitto/log
+    healthcheck:
+      # CMD-SHELL, not CMD: the exec form does not run a shell, so $MQTT_SERVER_USER
+      # would be passed to mosquitto_pub as a literal username and always be denied.
+      # A publish-and-check-exit-code probe is deterministic; waiting for a $SYS
+      # message is not, because $SYS only publishes every sys_interval (10s).
+      test: ["CMD-SHELL", "mosquitto_pub -h localhost -q 1 -u \"$$MQTT_SERVER_USER\" -P \"$$MQTT_SERVER_PASSWORD\" -t _healthcheck/probe -m ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  db:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-anpruser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-REDACTED}
+      POSTGRES_DB: ${POSTGRES_DB:-anpr}
+      # Read only by db/zz-cameras.sh, to seed the cameras table on first boot. The
+      # same CAM* vars go to the edge agents, so the registry and the agents cannot
+      # disagree about which cameras exist or where they are.
+      CAM1_ID: ${CAM1_ID:-}
+      CAM1_NAME: ${CAM1_NAME:-}
+      CAM1_ZONE: ${CAM1_ZONE:-}
+      CAM1_LAT: ${CAM1_LAT:-}
+      CAM1_LON: ${CAM1_LON:-}
+      CAM2_ID: ${CAM2_ID:-}
+      CAM2_NAME: ${CAM2_NAME:-}
+      CAM2_ZONE: ${CAM2_ZONE:-}
+      CAM2_LAT: ${CAM2_LAT:-}
+      CAM2_LON: ${CAM2_LON:-}
+      CAM3_ID: ${CAM3_ID:-}
+      CAM3_NAME: ${CAM3_NAME:-}
+      CAM3_ZONE: ${CAM3_ZONE:-}
+      CAM3_LAT: ${CAM3_LAT:-}
+      CAM3_LON: ${CAM3_LON:-}
+    volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ./db/zz-cameras.sh:/docker-entrypoint-initdb.d/zz-cameras.sh:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  ingest:
+    build: ./ingest
+    environment:
+      MQTT_HOST: mosquitto
+      MQTT_PORT: "1883"
+      MQTT_USERNAME: ${MQTT_INGEST_USER:-ingest}
+      MQTT_PASSWORD: ${MQTT_INGEST_PASSWORD:-REDACTED}
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:-anpruser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-REDACTED}
+      POSTGRES_DB: ${POSTGRES_DB:-anpr}
+    ports:
+      - "${INGEST_HOST_PORT:-8000}:8000"
+    volumes:
+      - ./contract:/app/contract:ro
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Read-only HTTP over the same PostGIS tables ingest writes. No MQTT credentials
+  # here on purpose: the map needs to read sightings, not publish them.
+  gis:
+    build: ./gis
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:-anpruser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-REDACTED}
+      POSTGRES_DB: ${POSTGRES_DB:-anpr}
+    ports:
+      - "${GIS_HOST_PORT:-8001}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # The dashboard. nginx serves the built SPA and reverse-proxies /api/ to the gis
+  # service, so the browser makes same-origin requests and no CORS handling is involved.
+  # The published port is for the browser only; the container listens on 80.
+  #
+  # The build context is a SIBLING checkout (../anpr-frontend), not a directory in this
+  # repo. `docker compose` resolves it relative to this file, so the two projects stay
+  # separate git repositories while still building together. If the frontend is checked
+  # out somewhere else, change this one path.
+  frontend:
+    build:
+      context: ../anpr-frontend
+      dockerfile: Dockerfile
+    environment:
+      # Consumed by nginx.conf.template at startup. Must be the compose service name,
+      # not localhost: inside the container "localhost" is nginx itself. The scheme is
+      # required - nginx rejects a bare "gis:8000" at startup.
+      GIS_UPSTREAM: http://gis:8000
+    ports:
+      - "${FRONTEND_HOST_PORT:-8080}:80"
+    depends_on:
+      gis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # --- Development / test harness ------------------------------------------------
+  #
+  # Both services sit behind the "sim" profile, so `docker compose up` never starts
+  # them. They are tools you invoke on purpose (`make sim-run`, `make seed-blacklist`,
+  # `make debug-subscribe`), not parts of the running platform - a synthetic traffic
+  # generator and a bus sniffer have no business writing to a real deployment's bus.
+  # To include them in a normal `up`: docker compose --profile sim up -d
+
+  # The synthetic detection publisher and the blacklist seeder. One image, two scripts;
+  # which one runs is chosen by the command, not by a second service definition.
+  sim:
+    build: ./sim
+    profiles: ["sim"]
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:-anpruser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-REDACTED}
+      POSTGRES_DB: ${POSTGRES_DB:-anpr}
+      # Where ./edge-agent/data is mounted in this container. The script's own default
+      # is the repo-relative host path, which does not exist inside the image.
+      SIM_DATA_DIR: /edge-agent-data
+    volumes:
+      # Bind-mounted so a change to the script takes effect without a rebuild, and so
+      # the generator writes into the very same host directories the edge agents have
+      # mounted. The parent is mounted (not the three inboxes separately) so adding a
+      # camera does not need another line here.
+      - ./sim:/app
+      - ./edge-agent/data:/edge-agent-data
+    depends_on:
+      db:
+        condition: service_healthy
+    # Overridden by the Makefile targets; this is the safe default (help text, not a
+    # runaway traffic generator left running by an accidental bare `up`).
+    command: ["python", "generate_detections.py", "--help"]
+
+  # Independent bus subscriber. Reads anpr/+/sightings with its own credentials and
+  # prints what arrives, so a missing sighting can be attributed to "the detector never
+  # published it" rather than "ingest dropped it". Deliberately NOT wired to anything
+  # else in the stack.
+  debug-subscriber:
+    build: ./server
+    profiles: ["sim"]
+    environment:
+      MQTT_HOST: mosquitto
+      MQTT_PORT: "1883"
+      MQTT_USERNAME: ${MQTT_DEBUG_USER:-debug}
+      MQTT_PASSWORD: ${MQTT_DEBUG_PASSWORD:-REDACTED}
+    volumes:
+      - ./server:/app
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    command: ["python", "subscriber.py"]
+
+  # One service per simulated camera. CAMERA_ID must equal that camera's MQTT
+  # username and mosquitto/config/acl.txt must grant it write access to
+  # anpr/{CAMERA_ID}/sightings, otherwise every event is refused at the broker.
+  # To add a camera: copy a block, add CAM*_ vars to .env, add the ACL user, then
+  # `make passwd`.
+  edge-agent-hinjewadi:
+    <<: *edge-agent
+    environment:
+      <<: *edge-agent-env
+      CAMERA_ID: ${CAM1_ID:?set CAM1_ID in .env}
+      CAMERA_LAT: ${CAM1_LAT:?set CAM1_LAT in .env}
+      CAMERA_LON: ${CAM1_LON:?set CAM1_LON in .env}
+      CAMERA_JITTER_M: ${CAM1_JITTER_M:-2}
+      MQTT_USERNAME: ${CAM1_ID:?set CAM1_ID in .env}
+      MQTT_PASSWORD: ${CAM1_PASS:?set CAM1_PASS in .env}
+    volumes:
+      - ./contract:/app/contract:ro
+      - ./edge-agent/data/hinjewadi:/data
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.health"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+
+  edge-agent-baner:
+    <<: *edge-agent
+    environment:
+      <<: *edge-agent-env
+      CAMERA_ID: ${CAM2_ID:?set CAM2_ID in .env}
+      CAMERA_LAT: ${CAM2_LAT:?set CAM2_LAT in .env}
+      CAMERA_LON: ${CAM2_LON:?set CAM2_LON in .env}
+      CAMERA_JITTER_M: ${CAM2_JITTER_M:-2}
+      MQTT_USERNAME: ${CAM2_ID:?set CAM2_ID in .env}
+      MQTT_PASSWORD: ${CAM2_PASS:?set CAM2_PASS in .env}
+    volumes:
+      - ./contract:/app/contract:ro
+      - ./edge-agent/data/baner:/data
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.health"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+
+  edge-agent-kothrud:
+    <<: *edge-agent
+    environment:
+      <<: *edge-agent-env
+      CAMERA_ID: ${CAM3_ID:?set CAM3_ID in .env}
+      CAMERA_LAT: ${CAM3_LAT:?set CAM3_LAT in .env}
+      CAMERA_LON: ${CAM3_LON:?set CAM3_LON in .env}
+      CAMERA_JITTER_M: ${CAM3_JITTER_M:-2}
+      MQTT_USERNAME: ${CAM3_ID:?set CAM3_ID in .env}
+      MQTT_PASSWORD: ${CAM3_PASS:?set CAM3_PASS in .env}
+    volumes:
+      - ./contract:/app/contract:ro
+      - ./edge-agent/data/kothrud:/data
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.health"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  pgdata:

@@ -1,0 +1,39 @@
+user server
+
+topic read $SYS/broker/uptime
+
+# Deterministic liveness probe. Subscribing to $SYS/broker/uptime and hoping a
+# message lands inside a short -W window is a coin flip against the 10s
+# sys_interval, so the healthcheck publishes here and checks the exit code instead.
+# Nothing subscribes to this topic: ingest only listens on anpr/+/sightings.
+topic write _healthcheck/probe
+
+
+user ingest
+
+topic read anpr/+/sightings
+
+
+# Debug subscriber (server/subscriber.py). Read-only and no more privileged than ingest
+# - it is a debugging aid, so it gets exactly the read access it needs and nothing
+# else. Separate from the ingest user on purpose: if it shared credentials you could
+# not tell from the broker's access log which subscriber saw a message, and revoking
+# the debug tool would mean revoking ingest.
+user debug
+
+topic read anpr/+/sightings
+
+
+user cam-pune-hinjewadi-01
+
+topic write anpr/cam-pune-hinjewadi-01/sightings
+
+
+user cam-pune-baner-02
+
+topic write anpr/cam-pune-baner-02/sightings
+
+
+user cam-pune-kothrud-03
+
+topic write anpr/cam-pune-kothrud-03/sightings

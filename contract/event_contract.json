@@ -1,0 +1,113 @@
+{
+  "schema_version": "1.0",
+  "_registration_notes": "CHANGING THE EVENT SHAPE: this file is the single source of truth for every service. When you add, remove or retype a field you must (1) update event.fields and event.required here, (2) update the field table and the example in contract/OD_INTERFACE.md, (3) extend the DDL in db/init.sql, and (4) if the field is required or changes type/range, update the json_schema block below. Ingest validates every payload against json_schema and drops anything that fails, so a field added to the prose but not to json_schema will be accepted-but-ignored, and a field added to json_schema without a DB column will break the insert at runtime, not at build time.",
+  "_json_schema_notes": "json_schema is the machine-checkable half of this contract and is what ingest/app/contract.py hands to the jsonschema library. The prose in event.fields is for humans and is never parsed. Two deliberate choices: additionalProperties is true because OD_INTERFACE.md rule 5 says unknown keys are preserved rather than rejected, and timestamp is a pattern rather than format:date-time because jsonschema only checks date-time when an optional format library is installed, and a silently-unenforced format is worse than an explicit regex.",
+  "transport": {
+    "protocol": "MQTT",
+    "broker_host": "mosquitto",
+    "port": 1883,
+    "topic_pattern": "anpr/{camera_id}/sightings",
+    "qos": 1,
+    "tls": false
+  },
+  "event": {
+    "name": "plate_sighting",
+    "required": ["plate_string", "confidence", "camera_id", "lat", "lon", "timestamp"],
+    "fields": {
+      "plate_string": "string, vehicle registration as read by the detector",
+      "confidence": "number, detector confidence, 0.0-1.0 inclusive",
+      "camera_id": "string, must equal the {camera_id} segment of the topic",
+      "lat": "number, WGS84 decimal degrees, -90 to 90",
+      "lon": "number, WGS84 decimal degrees, -180 to 180",
+      "timestamp": "ISO8601, UTC, moment of the sighting",
+      "image_ref": "string | null, optional, opaque reference to the captured frame",
+      "direction": "string | null, optional, enum: N | S | E | W | NE | NW | SE | SW",
+      "lane": "int | null, optional, lane number within the camera's field of view",
+      "vehicle_type": "string | null, optional, enum: car | bike | truck | bus. Null means the detector could not classify the vehicle; it is never guessed downstream."
+    },
+    "example": {
+      "plate_string": "MH12AB1234",
+      "confidence": 0.94,
+      "camera_id": "cam-pune-hinjewadi-01",
+      "lat": 18.5913,
+      "lon": 73.7389,
+      "timestamp": "2026-09-26T07:42:11Z",
+      "image_ref": "s3://anpr/cam-pune-hinjewadi-01/2026/09/26/074211.jpg",
+      "direction": "E",
+      "lane": 2,
+      "vehicle_type": "car"
+    }
+  },
+  "json_schema": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "plate_sighting",
+    "type": "object",
+    "required": ["plate_string", "confidence", "camera_id", "lat", "lon", "timestamp"],
+    "additionalProperties": true,
+    "properties": {
+      "plate_string": {
+        "type": "string",
+        "minLength": 1
+      },
+      "confidence": {
+        "type": "number",
+        "minimum": 0.0,
+        "maximum": 1.0
+      },
+      "camera_id": {
+        "type": "string",
+        "minLength": 1
+      },
+      "lat": {
+        "type": "number",
+        "minimum": -90.0,
+        "maximum": 90.0
+      },
+      "lon": {
+        "type": "number",
+        "minimum": -180.0,
+        "maximum": 180.0
+      },
+      "timestamp": {
+        "type": "string",
+        "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"
+      },
+      "image_ref": {
+        "type": ["string", "null"]
+      },
+      "direction": {
+        "type": ["string", "null"],
+        "enum": ["N", "S", "E", "W", "NE", "NW", "SE", "SW", null]
+      },
+      "lane": {
+        "type": ["integer", "null"]
+      },
+      "vehicle_type": {
+        "type": ["string", "null"],
+        "enum": ["car", "bike", "truck", "bus", null]
+      }
+    }
+  },
+  "contracts": {
+    "detection_to_ingest": {
+      "source": "contract/OD_INTERFACE.md",
+      "scope": "The upstream detection component is a black box. It is handed this JSON and nothing else, and is never asked for an event id, a storage handle or a rendering hint. It owns no downstream responsibility.",
+      "delivery": "one MQTT PUBLISH per sighting to anpr/{camera_id}/sightings at QoS 1, payload = the event object verbatim",
+      "input": {
+        "required": ["plate_string", "confidence", "camera_id", "lat", "lon", "timestamp"],
+        "fields": {
+          "plate_string": "string",
+          "confidence": "number, 0.0-1.0",
+          "camera_id": "string",
+          "lat": "number",
+          "lon": "number",
+          "timestamp": "ISO8601",
+          "image_ref": "string | null (optional)",
+          "direction": "N | S | E | W | NE | NW | SE | SW | null (optional)",
+          "lane": "int | null (optional)",
+          "vehicle_type": "car | bike | truck | bus | null (optional, detector-supplied; never inferred downstream)"
+        }
+      }
+    }
+  }
+}

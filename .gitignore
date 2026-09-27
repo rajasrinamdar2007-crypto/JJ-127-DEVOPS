@@ -1,0 +1,11 @@
+.env
+*.db
+venv/
+.venv/
+__pycache__/
+*.pyc
+mosquitto/data/
+mosquitto/log/
+mosquitto/config/passwords
+
+edge-agent/data/
