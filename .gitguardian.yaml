@@ -1,10 +1,14 @@
 version: 1
 
-# The scanner flagged .env.example because it carried working passwords (REDACTED,
-# REDACTED, REDACTED-03) in a public repository. Those are now CHANGEME-* placeholders
-# that cannot authenticate against anything, and the rules below stop the placeholders from
-# re-alerting on every push. Removing this file without first emptying .env.example of real
-# credentials would only silence a true positive.
+# The scanner flagged .env.example because it carried the local stack's working passwords
+# in a public repository. Those have been replaced with CHANGEME-* placeholders that
+# cannot authenticate against anything, and the rules below stop the placeholders from
+# re-alerting on every push. Removing this file without first emptying .env.example of
+# real credentials would only silence a true positive.
+#
+# The old values are deliberately not quoted anywhere in this repository, including here.
+# Naming them in a comment would republish them at the branch tip and hand the scanner
+# exactly what it is looking for.
 allow:
   - path: .env.example
     reason: >-
